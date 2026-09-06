@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ポップコーン・オンラインバトロワ</title>
+    <!-- サーバー不要でリアルタイム通信するライブラリ -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        * { touch-action: none; user-select: none; box-sizing: border-box; }
+        body { margin: 0; padding: 0; background-color: #1a0f07; color: #fff; font-family: sans-serif; overflow: hidden; text-align: center; }
+        
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            background: rgba(0,0,0,0.85); z-index: 10;
+        }
+        .btn {
+            background: #f39c12; color: #fff; border: none; padding: 15px 30px;
+            font-size: 18px; font-weight: bold; border-radius: 30px; margin: 10px; cursor: pointer;
+            box-shadow: 0 4px 0 #d35400;
+        }
+        .btn:active { transform: translateY(4px); box-shadow: none; }
+        #share-url {
+            width: 80%; max-width: 400px; padding: 10px; font-size: 14px;
+            background: #333; color: #fff; border: 1px solid #555; border-radius: 5px; margin-top: 10px;
+        }
+        #game-info {
+            position: absolute; top: 10px; left: 10px; z-index: 5; text-align: left;
+            font-size: 14px; background: rgba(0,0,0,0.5); padding: 8px 12px; border-radius: 8px;
+        }
+        #canvas { display: block; width: 100vw; height: 100vh; background: #2c1a0e; }
+    </style>
+</head>
+<body>
+
+    <!-- UIオーバーレイ -->
+    <div id="ui-layer">
+        <h1 style="color: #f1c40f; margin-bottom: 5px;">ポップコーン・サバイバル</h1>
+        <p style="color: #ccc; font-size: 14px; margin-bottom: 20px;">スマホ: タップ/ドラッグ移動<br>PC: 矢印キー移動</p>
+        
+        <div id="host-controls">
+            <button class="btn" onclick="copyInviteLink()">招待リンクをコピー</button>
+            <p style="font-size: 12px; color: #aaa;">リンクを送って友達を招待しよう！</p>
+            <input type="text" id="share-url" readonly>
+            <br><br>
+            <button class="btn" style="background:#27ae60; box-shadow:0 4px 0 #219150;" onclick="startGame()">全員でゲーム開始！</button>
+        </div>
+
+        <div id="client-wait" style="display: none;">
+            <p style="font-size: 18px; color: #f39c12;">ホストがゲームを開始するのを待っています...</p>
+        </div>
+    </div>
+
+    <!-- ゲーム情報表示 -->
+    <div id="game-info">
+        生存プレイヤー: <span id="player-count">1</span>名<br>
+        ステータス: <span id="status-text" style="color: #f1c40f;">待機中</span>
+    </div>
+
+    <canvas id="canvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        let width, height;
+        function resize() {
+            width = canvas.width = window.innerWidth;
+            height = canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // ネットワーク管理 (WebRTC)
+        let peer = null;
+        let connections = []; // ホスト用: 接続中のクライアントリスト
+        let hostConn = null;  // クライアント用: ホストとの接続
+        let isHost = true;
+        let myId = '';
+        let roomId = '';
+
+        // ゲーム状態
+        let gameState = 'WAITING'; // WAITING, PLAYING, GAMEOVER
+        let players = {};
+        let bullets = [];
+        let keys = {};
+        let touchPos = null;
+
+        // URLパラメータの解析（?room=XXXX があれば参加者として動作）
+        const urlParams = new URLSearchParams(window.location.search);
+        const joinRoomId = urlParams.get('room');
+
+        if (joinRoomId) {
+            isHost = false;
+            roomId = joinRoomId;
+            document.getElementById('host-controls').style.display = 'none';
+            document.getElementById('client-wait').style.display = 'block';
+            initPeer();
+        } else {
+            isHost = true;
+            initPeer();
+        }
+
+        function initPeer() {
+            // 無料のPeerJSシグナリングサーバーを使用
+            peer = new Peer();
+
+            peer.on('open', (id) => {
+                myId = id;
+                if (isHost) {
+                    roomId = id;
+                    const shareUrl = window.location.origin + window.location.pathname + '?room=' + roomId;
+                    document.getElementById('share-url').value = shareUrl;
+                    
+                    // 自分（ホスト）のプレイヤーを作成
+                    players[myId] = createPlayer(myId, true);
+                } else {
+                    // ホストへ接続
+                    hostConn = peer.connect(roomId);
+                    setupClientConnection();
+                }
+            });
+
+            if (isHost) {
+                // クライアントからの接続を受ける
+                peer.on('connection', (conn) => {
+                    connections.push(conn);
+                    const newPlayerId = conn.peer;
+
+                    conn.on('open', () => {
+                        players[newPlayerId] = createPlayer(newPlayerId, false);
+                        broadcastGameState();
+                    });
+
+                    conn.on('data', (data) => {
+                        if (data.type === 'INPUT' && players[newPlayerId]) {
+                            players[newPlayerId].x = data.x;
+                            players[newPlayerId].y = data.y;
+                        }
+                    });
+
+                    conn.on('close', () => {
+                        delete players[newPlayerId];
+                        connections = connections.filter(c => c !== conn);
+                        broadcastGameState();
+                    });
+                });
+            }
+        }
+
+        function setupClientConnection() {
+            hostConn.on('open', () => {
+                console.log('ホストに接続しました');
+            });
+
+            hostConn.on('data', (data) => {
+                if (data.type === 'SYNC') {
+                    players = data.players;
+                    bullets = data.bullets;
+                    gameState = data.gameState;
+
+                    if (gameState === 'PLAYING') {
+                        document.getElementById('ui-layer').style.display = 'none';
+                    }
+                    updateInfo();
+                }
+            });
+        }
+
+        function createPlayer(id, isHostPlayer) {
+            return {
+                id: id,
+                x: width / 2 + (Math.random() - 0.5) * 100,
+                y: height / 2 + (Math.random() - 0.5) * 100,
+                r: 15,
+                alive: true,
+                color: isHostPlayer ? '#f1c40f' : '#e67e22'
+            };
+        }
+
+        function copyInviteLink() {
+            const input = document.getElementById('share-url');
+            input.select();
+            document.execCommand('copy');
+            alert('招待リンクをコピーしました！友達に送信してください。');
+        }
+
+        function startGame() {
+            if (!isHost) return;
+            gameState = 'PLAYING';
+            document.getElementById('ui-layer').style.display = 'none';
+            
+            // 定期的にバター弾幕を生成
+            setInterval(() => {
+                if (gameState === 'PLAYING') {
+                    bullets.push({
+                        x: Math.random() * width,
+                        y: -10,
+                        vx: (Math.random() - 0.5) * 4,
+                        vy: Math.random() * 3 + 3,
+                        r: 10
+                    });
+                }
+            }, 100);
+
+            broadcastGameState();
+        }
+
+        // 入力処理 (スマホ・PC両対応)
+        window.addEventListener('keydown', e => keys[e.code] = true);
+        window.addEventListener('keyup', e => keys[e.code] = false);
+
+        canvas.addEventListener('pointerdown', e => touchPos = { x: e.clientX, y: e.clientY });
+        canvas.addEventListener('pointermove', e => { if (touchPos) touchPos = { x: e.clientX, y: e.clientY }; });
+        canvas.addEventListener('pointerup', () => touchPos = null);
+
+        function handleInput() {
+            const myPlayer = players[myId];
+            if (!myPlayer || !myPlayer.alive) return;
+
+            let moved = false;
+            const speed = 6;
+
+            // PCキーボード移動
+            if (keys['ArrowLeft'] || keys['KeyA']) { myPlayer.x -= speed; moved = true; }
+            if (keys['ArrowRight'] || keys['KeyD']) { myPlayer.x += speed; moved = true; }
+            if (keys['ArrowUp'] || keys['KeyW']) { myPlayer.y -= speed; moved = true; }
+            if (keys['ArrowDown'] || keys['KeyS']) { myPlayer.y += speed; moved = true; }
+
+            // スマホタッチ移動 (指の位置へ追従)
+            if (touchPos) {
+                const dx = touchPos.x - myPlayer.x;
+                const dy = touchPos.y - myPlayer.y;
+                const dist = Math.hypot(dx, dy);
+                if (dist > 5) {
+                    myPlayer.x += (dx / dist) * speed;
+                    myPlayer.y += (dy / dist) * speed;
+                    moved = true;
+                }
+            }
+
+            // 画面外はみ出し防止
+            myPlayer.x = Math.max(myPlayer.r, Math.min(width - myPlayer.r, myPlayer.x));
+            myPlayer.y = Math.max(myPlayer.r, Math.min(height - myPlayer.r, myPlayer.y));
+
+            // クライアントの場合は自分の位置情報をホストへ送信
+            if (!isHost && moved && hostConn && hostConn.open) {
+                hostConn.send({ type: 'INPUT', x: myPlayer.x, y: myPlayer.y });
+            }
+        }
+
+        // ホストによる全体同期
+        function broadcastGameState() {
+            if (!isHost) return;
+            const data = { type: 'SYNC', players, bullets, gameState };
+            connections.forEach(conn => {
+                if (conn.open) conn.send(data);
+            });
+            updateInfo();
+        }
+
+        function updateInfo() {
+            const aliveCount = Object.values(players).filter(p => p.alive).length;
+            document.getElementById('player-count').innerText = aliveCount;
+            document.getElementById('status-text').innerText = gameState === 'PLAYING' ? '戦闘中' : '待機中';
+        }
+
+        // メインゲームループ
+        function loop() {
+            handleInput();
+
+            if (isHost && gameState === 'PLAYING') {
+                // 弾の更新＆当たり判定処理
+                bullets.forEach((b, bIdx) => {
+                    b.x += b.vx;
+                    b.y += b.vy;
+
+                    // 当たり判定
+                    Object.values(players).forEach(p => {
+                        if (p.alive) {
+                            const dist = Math.hypot(p.x - b.x, p.y - b.y);
+                            if (dist < p.r + b.r) {
+                                p.alive = false; // 被弾したら不合格（弾ける）
+                            }
+                        }
+                    });
+                });
+
+                // 画面外の弾を削除
+                bullets = bullets.filter(b => b.y < height + 20 && b.x > -20 && b.x < width + 20);
+
+                broadcastGameState();
+            }
+
+            // --- 描画処理 ---
+            ctx.clearRect(0, 0, width, height);
+
+            // 弾（バターの粒）を描画
+            ctx.fillStyle = '#f1c40f';
+            bullets.forEach(b => {
+                ctx.beginPath();
+                ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+                ctx.fill();
+            });
+
+            // プレイヤーを描画
+            Object.values(players).forEach(p => {
+                ctx.beginPath();
+                if (p.alive) {
+                    ctx.fillStyle = p.color;
+                    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+                    ctx.fill();
+                } else {
+                    // 破裂したポップコーン（白い泡）
+                    ctx.fillStyle = '#ffffff';
+                    ctx.arc(p.x, p.y, p.r + 5, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            });
+
+            requestAnimationFrame(loop);
+        }
+
+        loop();
+    </script>
+</body>
+</html>
